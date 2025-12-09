@@ -3,8 +3,5 @@ __pycache__/
 .python-version
 .env
 
-# Outputs
-output/
-
 # Misc
 .DS_Store

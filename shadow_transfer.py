@@ -158,13 +158,13 @@ def request_shadowed_image(
     donor_mime, donor_bytes = load_image_bytes_for_api(donor_path, max_side)
     prompt = (
         "Use the FIRST image as the base and the SECOND image only as a shadow reference. "
-        "Apply the donor image's shadowing onto the target image with high fidelity. "
-        "Match the donor's shadow direction, softness, edge diffusion/blur, opacity, "
-        "density/darkness, length, and contact shadows. Allow realistic washout when the "
+        "Apply the donor image's shadowing onto the target image exactly as it appears in the donor. "
+        "Match the donor's shadow direction, softness, edge diffusion, opacity, "
+        "density, length, and contact shadows. Allow realistic washout when the "
         "target surface is lighter than the donor surface—shadow intensity should adapt "
         "by comparing nearby non-shadow surface tones: measure the surface brightness "
         "just outside the shadow in both donor and target, and adjust the target shadow "
-        "darkness by that difference so shadows sit naturally on the target surface. "
+        "darkness by that difference so shadows darkes the target surface realistically. "
         "Preserve the target furniture form, materials, textures, and colors—do not recolor "
         "or alter geometry; do NOT copy or replace objects from the donor. "
         "Keep the target's canvas size, framing, and alignment unchanged. Avoid halos, "
