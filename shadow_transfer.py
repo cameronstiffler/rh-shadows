@@ -271,7 +271,7 @@ def main() -> None:
         "--max-side",
         type=int,
         default=int(os.getenv("MAX_SIDE", "0")),
-        help="Max long-edge pixels to send to Gemini (0 for full resolution; set only if you need to downscale).",
+        help="Requested max long-edge pixels to send to Gemini (0 for uncapped request; actual send is clamped by API_MAX_SIDE).",
     )
     args = parser.parse_args()
 
@@ -279,12 +279,20 @@ def main() -> None:
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY is missing. Populate .env or the environment.")
 
+    api_max_side = int(os.getenv("API_MAX_SIDE", "6144"))
+    requested_max_side = args.max_side
+    effective_max_side = api_max_side if requested_max_side <= 0 else min(requested_max_side, api_max_side)
+
     target_root = Path(args.targets)
     donor_root = Path(args.donors)
     output_root = Path(args.output)
     output_root.mkdir(parents=True, exist_ok=True)
 
     print(f"Using model: {args.model}")
+    print(
+        f"Input sizing: requested max_side={requested_max_side or 'uncapped'}, "
+        f"API cap={api_max_side}, effective max_side={effective_max_side}"
+    )
     print(f"Indexing donors in {donor_root}...")
     donor_index = build_donor_index(donor_root)
     print(f"Indexed {len(donor_index)} donor views.")
@@ -312,11 +320,11 @@ def main() -> None:
         print(f"Processing {target_path.name} with donor {donor_path.name}...")
         print(
             f"   Sending both images to Gemini as PNG (converted in-memory, "
-            f"max_side={args.max_side or 'original'})."
+            f"max_side={effective_max_side or 'original'})."
         )
         try:
             image_bytes = request_shadowed_image(
-                model, target_path, donor_path, args.max_side
+                model, target_path, donor_path, effective_max_side
             )
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to process {target_path.name}: {exc}")
