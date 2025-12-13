@@ -14,6 +14,7 @@ import re
 import base64
 from io import BytesIO
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -21,8 +22,9 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from PIL import Image
 
-# Allow large source images; we downscale before sending to the API.
+# Allow large source images; default behavior is to send full resolution to the API.
 Image.MAX_IMAGE_PIXELS = None
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 ImageKey = Tuple[str, str]
 DEFAULT_SAFETY_SETTINGS = [
@@ -101,6 +103,35 @@ def extract_image_from_response(response) -> bytes:
     raise RuntimeError("No image returned by Gemini response.")
 
 
+def enforce_output_dimensions(image_bytes: bytes, target_size: Tuple[int, int]) -> bytes:
+    """Match target dimensions without distorting aspect ratio (center-pad if needed)."""
+    target_w, target_h = target_size
+    with Image.open(BytesIO(image_bytes)) as img:
+        src_w, src_h = img.size
+        if (src_w, src_h) == (target_w, target_h):
+            return image_bytes
+
+        scale = min(target_w / float(src_w), target_h / float(src_h))
+        new_size = (
+            max(1, int(round(src_w * scale))),
+            max(1, int(round(src_h * scale))),
+        )
+        resized = img.resize(new_size, resample=Image.LANCZOS).convert("RGBA")
+        if resized.size == (target_w, target_h):
+            output = resized
+        else:
+            output = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            offset = (
+                (target_w - resized.size[0]) // 2,
+                (target_h - resized.size[1]) // 2,
+            )
+            output.paste(resized, offset)
+
+        buffer = BytesIO()
+        output.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
 def summarize_response_for_debug(response) -> str:
     summaries = []
     for idx, candidate in enumerate(getattr(response, "candidates", [])):
@@ -152,13 +183,25 @@ def load_image_bytes_for_api(path: Path, max_side: int) -> Tuple[str, bytes]:
 
 
 def request_shadowed_image(
-    model: genai.GenerativeModel, target_path: Path, donor_path: Path, max_side: int
+    model: genai.GenerativeModel,
+    target_path: Path,
+    donor_path: Path,
+    max_side: int,
+    attempts: int = 3,
+    backoff: int = 10,
 ) -> bytes:
     target_mime, target_bytes = load_image_bytes_for_api(target_path, max_side)
     donor_mime, donor_bytes = load_image_bytes_for_api(donor_path, max_side)
+    with Image.open(target_path) as base_img:
+        target_size = base_img.size
     prompt = (
         "Use the FIRST image as the base and the SECOND image only as a shadow reference. "
-        "Apply the donor image's shadowing onto the target image exactly as it appears in the donor. "
+        "Extract only the shadow shapes/softness from the donor and apply them onto the target exactly as they appear in the donor. "
+        "Shadows must stay anchored to the same furniture geometry for this view (filenames correspond), with no shifts, rotations, or scaling. "
+        "Do NOT stretch or squash the target; keep proportions and framing identical to the target image. "
+        "Do NOT bring over donor background or floor/ground; keep the target's background/floor exactly as-is except for the added shadow darkening. "
+        "Do NOT move or invent shadows; do NOT borrow colors or textures—transfer only light falloff/shadow density from the donor. "
+        "If shadows in the donor are faint or subtle, still detect and transfer their exact position/shape/softness; if the donor truly has no shadow, leave the target's shadowing unchanged. "
         "Match the donor's shadow direction, softness, edge diffusion, opacity, "
         "density, length, and contact shadows. Allow realistic washout when the "
         "target surface is lighter than the donor surface—shadow intensity should adapt "
@@ -167,26 +210,38 @@ def request_shadowed_image(
         "darkness by that difference so shadows darkes the target surface realistically. "
         "Preserve the target furniture form, materials, textures, and colors—do not recolor "
         "or alter geometry; do NOT copy or replace objects from the donor. "
-        "Keep the target's canvas size, framing, and alignment unchanged. Avoid halos, "
-        "glow, and added reflections. Return a single rendered image without overlays or text."
+        "Keep the target's canvas size, framing, and alignment unchanged. "
+        "Avoid halos, "
+        "glow, and added reflections. Return only the rendered image (PNG) without overlays or text."
     )
-    response = model.generate_content(
-        [
-            {"mime_type": target_mime, "data": target_bytes},
-            {"mime_type": donor_mime, "data": donor_bytes},
-            prompt,
-        ],
-        safety_settings=DEFAULT_SAFETY_SETTINGS,
-        request_options={"timeout": 300},
-    )
-    try:
-        return extract_image_from_response(response)
-    except RuntimeError as exc:
-        debug_summary = summarize_response_for_debug(response)
-        prompt_feedback = getattr(response, "prompt_feedback", None)
-        raise RuntimeError(
-            f"{exc} (response summary: {debug_summary}, prompt_feedback={prompt_feedback})"
-        ) from exc
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            response = model.generate_content(
+                [
+                    {"mime_type": target_mime, "data": target_bytes},
+                    {"mime_type": donor_mime, "data": donor_bytes},
+                    prompt,
+                ],
+                safety_settings=DEFAULT_SAFETY_SETTINGS,
+                request_options={"timeout": 300},
+            )
+            image_bytes = extract_image_from_response(response)
+            return enforce_output_dimensions(image_bytes, target_size)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            err_text = str(exc)
+            should_retry = any(token in err_text for token in ("Deadline", "timeout", "504"))
+            if attempt >= attempts or not should_retry:
+                break
+            delay = backoff * attempt
+            print(f"Retrying ({attempt}/{attempts}) after {delay}s due to: {exc}")
+            time.sleep(delay)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown failure requesting shadowed image.")
 
 
 def iter_targets(target_root: Path) -> Iterable[Path]:
@@ -196,6 +251,9 @@ def iter_targets(target_root: Path) -> Iterable[Path]:
 
 
 def main() -> None:
+    # Load environment variables from the script directory so we pick up .env reliably.
+    load_dotenv(dotenv_path=SCRIPT_DIR / ".env")
+
     parser = argparse.ArgumentParser(description="Apply donor shadows to target images.")
     parser.add_argument("--targets", default="targets", help="Target images root directory.")
     parser.add_argument("--donors", default="donors", help="Donor images root directory.")
@@ -212,12 +270,11 @@ def main() -> None:
     parser.add_argument(
         "--max-side",
         type=int,
-        default=int(os.getenv("MAX_SIDE", "4096")),
-        help="Max long-edge pixels to send to Gemini (0 to disable).",
+        default=int(os.getenv("MAX_SIDE", "0")),
+        help="Max long-edge pixels to send to Gemini (0 for full resolution; set only if you need to downscale).",
     )
     args = parser.parse_args()
 
-    load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY is missing. Populate .env or the environment.")
@@ -227,6 +284,7 @@ def main() -> None:
     output_root = Path(args.output)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    print(f"Using model: {args.model}")
     print(f"Indexing donors in {donor_root}...")
     donor_index = build_donor_index(donor_root)
     print(f"Indexed {len(donor_index)} donor views.")
@@ -257,7 +315,9 @@ def main() -> None:
             f"max_side={args.max_side or 'original'})."
         )
         try:
-            image_bytes = request_shadowed_image(model, target_path, donor_path, args.max_side)
+            image_bytes = request_shadowed_image(
+                model, target_path, donor_path, args.max_side
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to process {target_path.name}: {exc}")
             continue
