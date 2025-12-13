@@ -5,3 +5,7 @@ __pycache__/
 
 # Misc
 .DS_Store
+
+# Large binary assets should not be committed
+*.tif
+*.tiff
