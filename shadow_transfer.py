@@ -22,9 +22,10 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from PIL import Image
 
-# Allow large source images; default behavior is to send full resolution to the API.
+# Allow large source images; default behavior is to send 4K long-edge images to the API.
 Image.MAX_IMAGE_PIXELS = None
 SCRIPT_DIR = Path(__file__).resolve().parent
+FOUR_K_LONG_EDGE = 4096
 
 ImageKey = Tuple[str, str]
 DEFAULT_SAFETY_SETTINGS = [
@@ -149,26 +150,30 @@ def summarize_response_for_debug(response) -> str:
     return "; ".join(summaries) if summaries else "no candidates"
 
 
-def resize_if_needed(img: Image.Image, max_side: int) -> Image.Image:
-    """Downscale image to max_side on the longest edge to keep payload reasonable."""
-    if max_side <= 0:
+def resize_to_long_edge(img: Image.Image, long_edge: int) -> Image.Image:
+    """Resize (up or down) to the requested long-edge size."""
+    if long_edge <= 0:
         return img
     width, height = img.size
     longest = max(width, height)
-    if longest <= max_side:
+    if longest == long_edge:
         return img
-    scale = max_side / float(longest)
-    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    scale = long_edge / float(longest)
+    new_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
     return img.resize(new_size, resample=Image.LANCZOS)
 
 
-def load_image_bytes_for_api(path: Path, max_side: int) -> Tuple[str, bytes]:
+def load_image_bytes_for_api(path: Path, long_edge: int) -> Tuple[str, bytes, Tuple[int, int]]:
     """Always returns PNG bytes for Gemini to avoid TIFF ingestion issues."""
     with Image.open(path) as img:
         # Preserve transparency if present; otherwise keep RGB.
         mode = "RGBA" if img.mode in ("RGBA", "LA") else "RGB"
         converted = img.convert(mode)
-        converted = resize_if_needed(converted, max_side)
+        converted = resize_to_long_edge(converted, long_edge)
+        final_size = converted.size
         # Saving to a real temp file avoids PIL _idat.fileno issues on some builds.
         tmp_path: Optional[Path] = None
         try:
@@ -176,7 +181,7 @@ def load_image_bytes_for_api(path: Path, max_side: int) -> Tuple[str, bytes]:
                 tmp_path = Path(tmp.name)
             converted.save(tmp_path, format="PNG")
             data = tmp_path.read_bytes()
-            return "image/png", data
+            return "image/png", data, final_size
         finally:
             if tmp_path and tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
@@ -190,10 +195,8 @@ def request_shadowed_image(
     attempts: int = 3,
     backoff: int = 10,
 ) -> bytes:
-    target_mime, target_bytes = load_image_bytes_for_api(target_path, max_side)
-    donor_mime, donor_bytes = load_image_bytes_for_api(donor_path, max_side)
-    with Image.open(target_path) as base_img:
-        target_size = base_img.size
+    target_mime, target_bytes, target_size = load_image_bytes_for_api(target_path, max_side)
+    donor_mime, donor_bytes, _ = load_image_bytes_for_api(donor_path, max_side)
     prompt = (
         "Use the FIRST image as the base and the SECOND image only as a shadow reference. "
         "Extract only the shadow shapes/softness from the donor and apply them onto the target exactly as they appear in the donor. "
@@ -270,8 +273,8 @@ def main() -> None:
     parser.add_argument(
         "--max-side",
         type=int,
-        default=int(os.getenv("MAX_SIDE", "0")),
-        help="Requested max long-edge pixels to send to Gemini (0 for uncapped request; actual send is clamped by API_MAX_SIDE).",
+        default=int(os.getenv("MAX_SIDE", str(FOUR_K_LONG_EDGE))),
+        help="Requested long-edge resolution to send to Gemini (0 for uncapped request; actual send is clamped by API_MAX_SIDE).",
     )
     args = parser.parse_args()
 
@@ -279,7 +282,7 @@ def main() -> None:
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY is missing. Populate .env or the environment.")
 
-    api_max_side = int(os.getenv("API_MAX_SIDE", "6144"))
+    api_max_side = int(os.getenv("API_MAX_SIDE", str(FOUR_K_LONG_EDGE)))
     requested_max_side = args.max_side
     effective_max_side = api_max_side if requested_max_side <= 0 else min(requested_max_side, api_max_side)
 
@@ -290,8 +293,8 @@ def main() -> None:
 
     print(f"Using model: {args.model}")
     print(
-        f"Input sizing: requested max_side={requested_max_side or 'uncapped'}, "
-        f"API cap={api_max_side}, effective max_side={effective_max_side}"
+        f"Input sizing: requested long_edge={requested_max_side or 'uncapped'}, "
+        f"API cap={api_max_side}, effective long_edge={effective_max_side}"
     )
     print(f"Indexing donors in {donor_root}...")
     donor_index = build_donor_index(donor_root)
@@ -320,7 +323,7 @@ def main() -> None:
         print(f"Processing {target_path.name} with donor {donor_path.name}...")
         print(
             f"   Sending both images to Gemini as PNG (converted in-memory, "
-            f"max_side={effective_max_side or 'original'})."
+            f"long_edge={effective_max_side or 'original'}); enforcing responses to the same size."
         )
         try:
             image_bytes = request_shadowed_image(
