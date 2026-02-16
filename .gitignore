@@ -2,6 +2,7 @@
 __pycache__/
 .python-version
 .env
+vertex.json
 
 # Misc
 .DS_Store
