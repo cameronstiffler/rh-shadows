@@ -13,14 +13,12 @@ import asyncio
 import os
 import re
 import base64
-import math
 from io import BytesIO
 import tempfile
 import time
 import threading
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
-from dataclasses import dataclass
 
 from google import genai
 from google.genai import types
@@ -43,29 +41,6 @@ DEBUG_LONG_EDGE = 2048
 
 # Donor contrast boost before submission (1.0 = no change).
 DONOR_CONTRAST_BOOST = float(os.getenv("DONOR_CONTRAST_BOOST", "1.0"))
-
-SUPPORTED_RATIOS: list[tuple[int, int]] = [
-    (1, 1),
-    (16, 9),
-    (4, 3),
-    (3, 2),
-    (21, 9),
-    (9, 16),
-    (3, 4),
-    (2, 3),
-    (5, 4),
-    (4, 5),
-]
-
-
-@dataclass(frozen=True)
-class PadInfo:
-    sent_w: int
-    sent_h: int
-    left: int
-    top: int
-    right: int
-    bottom: int
 
 ImageKey = Tuple[str, str]
 DEFAULT_SAFETY_SETTINGS = [
@@ -131,214 +106,15 @@ def extract_image_from_response(response) -> bytes:
     raise RuntimeError("No image returned by Gemini response.")
 
 
-def _align_output_by_corner_marks(
-    image_bytes: bytes,
-    recipient_size: Tuple[int, int],
-    threshold: int = 16,
-    window: int = 24,
-) -> Optional[bytes]:
-    with Image.open(BytesIO(image_bytes)) as img:
-        gray = img.convert("L")
-        w, h = gray.size
-        win = max(1, min(window, w, h))
-        pix = gray.load()
-
-        def find_tl() -> Optional[Tuple[int, int]]:
-            for y in range(0, win):
-                for x in range(0, win):
-                    if pix[x, y] <= threshold:
-                        return (x, y)
-            return None
-
-        def find_tr() -> Optional[Tuple[int, int]]:
-            for y in range(0, win):
-                for x in range(w - 1, w - win - 1, -1):
-                    if pix[x, y] <= threshold:
-                        return (x, y)
-            return None
-
-        def find_bl() -> Optional[Tuple[int, int]]:
-            for y in range(h - 1, h - win - 1, -1):
-                for x in range(0, win):
-                    if pix[x, y] <= threshold:
-                        return (x, y)
-            return None
-
-        def find_br() -> Optional[Tuple[int, int]]:
-            for y in range(h - 1, h - win - 1, -1):
-                for x in range(w - 1, w - win - 1, -1):
-                    if pix[x, y] <= threshold:
-                        return (x, y)
-            return None
-
-        tl = find_tl()
-        tr = find_tr()
-        bl = find_bl()
-        br = find_br()
-        if not all((tl, tr, bl, br)):
-            return None
-
-        left = min(tl[0], bl[0])
-        right = max(tr[0], br[0])
-        top = min(tl[1], tr[1])
-        bottom = max(bl[1], br[1])
-        if right <= left or bottom <= top:
-            return None
-
-        crop = img.crop((left, top, right + 1, bottom + 1))
-        resized = crop.resize(recipient_size, resample=Image.LANCZOS).convert("RGBA")
-        buffer = BytesIO()
-        resized.save(buffer, format="PNG")
-        return buffer.getvalue()
-
-
-def _closest_ratio(
-    src_w: int, src_h: int, allowed: list[tuple[int, int]]
-) -> tuple[int, int]:
-    r = src_w / src_h
-    best = allowed[0]
-    best_err = float("inf")
-    for a, b in allowed:
-        ar = a / b
-        err = abs(math.log(r / ar))
-        if err < best_err:
-            best_err = err
-            best = (a, b)
-    return best
-
-
-def _round_to_multiple(n: int, multiple: int) -> int:
-    return max(multiple, (n // multiple) * multiple)
-
-
-def pick_target_size(
-    src_w: int,
-    src_h: int,
-    *,
-    max_side: int,
-    multiple: int,
-    allowed_ratios: list[tuple[int, int]],
-) -> Tuple[int, int, tuple[int, int]]:
-    if max_side <= 0 or multiple <= 0:
-        raise ValueError("max_side and multiple must be positive")
-    a, b = _closest_ratio(src_w, src_h, allowed_ratios)
-    src_ratio = src_w / src_h
-    dst_ratio = a / b
-    if src_ratio >= dst_ratio:
-        target_w = max_side
-        target_h = round(max_side * b / a)
-    else:
-        target_h = max_side
-        target_w = round(max_side * a / b)
-    target_w = _round_to_multiple(target_w, multiple)
-    target_h = _round_to_multiple(target_h, multiple)
-    return target_w, target_h, (a, b)
-
-
-def pad_letterbox(
-    im: Image.Image,
-    target_w: int,
-    target_h: int,
-    *,
-    pad_color: Tuple[int, int, int] = (255, 255, 255),
-) -> Tuple[Image.Image, PadInfo]:
-    if target_w <= 0 or target_h <= 0:
-        raise ValueError("target_w/target_h must be positive")
-
-    mode = im.mode
-    if mode not in ("RGB", "RGBA", "L"):
-        mode = "RGB"
-        im = im.convert(mode)
-
-    src_w, src_h = im.size
-    src_ratio = src_w / src_h
-    dst_ratio = target_w / target_h
-    if src_ratio > dst_ratio:
-        new_w = target_w
-        new_h = round(target_w / src_ratio)
-    else:
-        new_h = target_h
-        new_w = round(target_h * src_ratio)
-
-    resized = im.resize((new_w, new_h), resample=Image.LANCZOS)
-
-    pad = pad_color
-    if mode == "L":
-        pad = pad_color[0]
-    elif mode == "RGB" and len(pad_color) == 4:
-        pad = pad_color[:3]
-
-    canvas = Image.new(mode, (target_w, target_h), color=pad)
-    left = (target_w - new_w) // 2
-    top = (target_h - new_h) // 2
-    canvas.paste(resized, (left, top))
-    right = target_w - new_w - left
-    bottom = target_h - new_h - top
-    return canvas, PadInfo(sent_w=target_w, sent_h=target_h, left=left, top=top, right=right, bottom=bottom)
-
-
-def crop_back_from_letterbox(returned: Image.Image, pad: PadInfo) -> Image.Image:
-    ret_w, ret_h = returned.size
-    sx = ret_w / pad.sent_w
-    sy = ret_h / pad.sent_h
-    left = int(round(pad.left * sx))
-    right = int(round(pad.right * sx))
-    top = int(round(pad.top * sy))
-    bottom = int(round(pad.bottom * sy))
-    left = max(0, min(left, ret_w))
-    right = max(0, min(right, ret_w - left))
-    top = max(0, min(top, ret_h))
-    bottom = max(0, min(bottom, ret_h - top))
-    return returned.crop((left, top, ret_w - right, ret_h - bottom))
-
-
-def enforce_output_dimensions(
-    image_bytes: bytes, recipient_size: Tuple[int, int], mode: str = "pad"
-) -> bytes:
-    """Match recipient dimensions; mode='pad' preserves aspect, mode='stretch' resizes exactly."""
+def enforce_output_dimensions(image_bytes: bytes, recipient_size: Tuple[int, int]) -> bytes:
+    """Resize an image to match the recipient dimensions."""
     recipient_w, recipient_h = recipient_size
     with Image.open(BytesIO(image_bytes)) as img:
-        src_w, src_h = img.size
-        if (src_w, src_h) == (recipient_w, recipient_h):
+        if img.size == (recipient_w, recipient_h):
             return image_bytes
-
-        if mode == "stretch":
-            resized = img.resize((recipient_w, recipient_h), resample=Image.LANCZOS).convert("RGBA")
-            buffer = BytesIO()
-            resized.save(buffer, format="PNG")
-            return buffer.getvalue()
-        if mode == "corner":
-            threshold = int(os.getenv("SHADOW_MASK_CORNER_THRESHOLD", "16"))
-            window = int(os.getenv("SHADOW_MASK_CORNER_WINDOW", "24"))
-            aligned = _align_output_by_corner_marks(
-                image_bytes, (recipient_w, recipient_h), threshold=threshold, window=window
-            )
-            if aligned is not None:
-                return aligned
-            # Fallback to stretch if no marks found.
-            resized = img.resize((recipient_w, recipient_h), resample=Image.LANCZOS).convert("RGBA")
-            buffer = BytesIO()
-            resized.save(buffer, format="PNG")
-            return buffer.getvalue()
-
-        scale = min(recipient_w / float(src_w), recipient_h / float(src_h))
-        new_size = (
-            max(1, int(round(src_w * scale))),
-            max(1, int(round(src_h * scale))),
-        )
-        resized = img.resize(new_size, resample=Image.LANCZOS).convert("RGBA")
-        if resized.size == (recipient_w, recipient_h):
-            output = resized
-        else:
-            output = Image.new("RGBA", (recipient_w, recipient_h), (0, 0, 0, 0))
-            offset = (
-                (recipient_w - resized.size[0]) // 2,
-                (recipient_h - resized.size[1]) // 2,
-            )
-            output.paste(resized, offset)
-
+        resized = img.resize((recipient_w, recipient_h), resample=Image.LANCZOS).convert("RGBA")
         buffer = BytesIO()
-        output.save(buffer, format="PNG")
+        resized.save(buffer, format="PNG")
         return buffer.getvalue()
 
 
@@ -399,6 +175,21 @@ def summarize_response_for_debug(response) -> str:
     return "; ".join(summaries) if summaries else "no candidates"
 
 
+def _pick_prompt_match(paths: list[Path], prompt_id: int) -> Path:
+    if len(paths) == 1:
+        return paths[0]
+    filtered = [
+        p for p in paths if not re.search(r"(?:\\bcopy\\b|\\bbackup\\b|\\bold\\b)", p.stem, re.IGNORECASE)
+    ]
+    if not filtered:
+        filtered = paths
+    filtered.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    chosen = filtered[0]
+    matches = ", ".join(p.name for p in sorted(paths))
+    print(f"Warning: multiple prompt files match PID{prompt_id}: {matches}. Using {chosen.name}.")
+    return chosen
+
+
 def _select_prompt_by_id(prompt_id: int) -> Path:
     if not PROMPTS_DIR.is_dir():
         raise FileNotFoundError(f"Prompts directory not found: {PROMPTS_DIR}")
@@ -418,16 +209,10 @@ def _select_prompt_by_id(prompt_id: int) -> Path:
         elif fallback_pat.search(name):
             fallback.append(path)
 
-    if len(strict) == 1:
-        return strict[0]
-    if len(strict) > 1:
-        matches = ", ".join(p.name for p in sorted(strict))
-        raise ValueError(f"Multiple prompt files match PID{prompt_id}: {matches}")
-    if len(fallback) == 1:
-        return fallback[0]
-    if len(fallback) > 1:
-        matches = ", ".join(p.name for p in sorted(fallback))
-        raise ValueError(f"Multiple prompt files match PID{prompt_id} (fallback): {matches}")
+    if len(strict) >= 1:
+        return _pick_prompt_match(strict, prompt_id)
+    if len(fallback) >= 1:
+        return _pick_prompt_match(fallback, prompt_id)
 
     raise FileNotFoundError(
         f"No prompt file found containing PID{prompt_id} in the filename."
@@ -493,13 +278,6 @@ def is_shadow_only(prompt_path: Path) -> bool:
         return env
     name = prompt_path.name.lower()
     return "shadow_only" in name or "shadow-only" in name
-
-
-def shadow_mask_source(default: str = "model") -> str:
-    raw = os.getenv("SHADOW_MASK_SOURCE")
-    if raw:
-        return raw.strip().lower()
-    return default
 
 
 def use_vertex_backend() -> bool:
@@ -910,49 +688,8 @@ def align_shadow_alpha(
     return aligned
 
 
-def extract_shadow_mask_from_donor(
-    donor_path: Path,
-    normalize: Optional[bool] = None,
-    percentile: Optional[float] = None,
-    gamma: Optional[float] = None,
-) -> Image.Image:
-    with Image.open(donor_path) as img:
-        rgb = img.convert("RGB")
-
-    bg_color = sample_background_color(rgb)
-    bg_luma = 0.2126 * bg_color[0] + 0.7152 * bg_color[1] + 0.0722 * bg_color[2]
-    bg_luma = max(bg_luma, 1.0)
-
-    arr = np.asarray(rgb).astype(np.float32)
-    luma = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
-    shadow = (bg_luma - luma) / bg_luma
-    shadow = np.clip(shadow, 0.0, 1.0)
-
-    do_normalize = _env_flag("SHADOW_EXTRACT_NORMALIZE") is not False if normalize is None else normalize
-    if do_normalize:
-        pct = float(os.getenv("SHADOW_EXTRACT_PERCENTILE", "99")) if percentile is None else percentile
-        denom = np.percentile(shadow, pct)
-        if denom > 1e-6:
-            shadow = np.clip(shadow / denom, 0.0, 1.0)
-
-    use_gamma = float(os.getenv("SHADOW_EXTRACT_GAMMA", "1.0")) if gamma is None else gamma
-    if use_gamma != 1.0:
-        shadow = np.power(shadow, use_gamma)
-
-    mask = (shadow * 255.0).astype(np.uint8)
-    return Image.fromarray(mask, mode="L")
-
-
-def extract_shadow_mask_from_recipient(recipient_path: Path) -> Image.Image:
-    with Image.open(recipient_path) as img:
-        alpha = img.convert("RGBA").split()[3]
-    opaque_thresh = int(os.getenv("SHADOW_RECIPIENT_OPAQUE_THRESHOLD", "220"))
-    mask = alpha.point(lambda a: 0 if a >= opaque_thresh else a)
-    return mask
-
-
 def apply_shadow_mask_to_recipient(
-    recipient_path: Path, mask_bytes: bytes, options: Optional[dict] = None
+    recipient_path: Path, mask_bytes: bytes
 ) -> Tuple[Image.Image, Image.Image, Image.Image]:
     with Image.open(recipient_path) as rec:
         recipient_rgba = rec.convert("RGBA")
@@ -962,55 +699,18 @@ def apply_shadow_mask_to_recipient(
     if mask.size != recipient_rgba.size:
         mask = mask.resize(recipient_rgba.size, Image.LANCZOS)
 
-    options = options or {}
-    white_is_shadow = options.get("white_is_shadow")
+    white_is_shadow = _env_flag("SHADOW_MASK_WHITE_IS_SHADOW")
     if white_is_shadow is None:
-        white_is_shadow = _env_flag("SHADOW_MASK_WHITE_IS_SHADOW")
-    if white_is_shadow is None:
-        white_is_shadow = True
-    if white_is_shadow:
-        shadow_alpha = mask
-    else:
-        # Mask: white=no shadow, black=full shadow.
-        shadow_alpha = ImageOps.invert(mask)
+        white_is_shadow = False
+    shadow_alpha = mask if white_is_shadow else ImageOps.invert(mask)
 
-    normalize_mask = options.get("normalize_mask")
-    if normalize_mask is None:
-        normalize_mask = _env_flag("SHADOW_MASK_NORMALIZE") is not False
-    if normalize_mask:
-        arr = np.asarray(shadow_alpha).astype(np.float32)
-        pct = float(os.getenv("SHADOW_MASK_NORMALIZE_PERCENTILE", "98"))
-        denom = np.percentile(arr, pct)
-        if denom > 1e-6:
-            arr = np.clip(arr / denom, 0.0, 1.0)
-        gamma = float(os.getenv("SHADOW_MASK_INPUT_GAMMA", "1.0"))
-        if gamma != 1.0:
-            arr = np.power(arr, gamma)
-        shadow_alpha = Image.fromarray((arr * 255.0).astype(np.uint8), mode="L")
-
-    offset_x = int(options.get("offset_x", os.getenv("SHADOW_MASK_OFFSET_X", "0")))
-    offset_y = int(options.get("offset_y", os.getenv("SHADOW_MASK_OFFSET_Y", "0")))
-    if offset_x != 0 or offset_y != 0:
-        shifted = Image.new("L", shadow_alpha.size, 0)
-        shifted.paste(shadow_alpha, (offset_x, offset_y))
-        shadow_alpha = shifted
-
-    clear_corner_marks = options.get("clear_corner_marks")
-    if clear_corner_marks is None:
-        clear_corner_marks = _env_flag("SHADOW_MASK_CLEAR_CORNER_MARKS") is True
-    if clear_corner_marks:
-        w, h = shadow_alpha.size
-        if w > 1 and h > 1:
-            if shadow_alpha.readonly:
-                shadow_alpha = shadow_alpha.copy()
-            pixels = shadow_alpha.load()
-            pixels[0, 0] = 0
-            pixels[w - 1, 0] = 0
-            pixels[0, h - 1] = 0
-            pixels[w - 1, h - 1] = 0
     strength = float(os.getenv("SHADOW_MASK_STRENGTH", "1.0"))
     if strength != 1.0:
         shadow_alpha = shadow_alpha.point(lambda a: int(max(0, min(255, a * strength))))
+
+    min_alpha = int(os.getenv("SHADOW_MASK_MIN_ALPHA", "0"))
+    if min_alpha > 0:
+        shadow_alpha = shadow_alpha.point(lambda a: 0 if a < min_alpha else a)
 
     def _mask_max(img: Image.Image) -> int:
         extrema = img.getextrema()
@@ -1018,39 +718,34 @@ def apply_shadow_mask_to_recipient(
             return extrema[1]
         return 0
 
-    # Remove any shadow where the recipient object itself is opaque (prevents "ghost chair").
-    remove_enabled = options.get("remove_recipient")
+    remove_enabled = _env_flag("SHADOW_MASK_REMOVE_RECIPIENT")
     if remove_enabled is None:
-        remove_enabled = _env_flag("SHADOW_MASK_REMOVE_RECIPIENT") is not False
+        remove_enabled = True
     if remove_enabled:
         pre_remove = shadow_alpha
-        alpha_thresh = int(options.get("remove_threshold", os.getenv("SHADOW_MASK_REMOVE_THRESHOLD", "8")))
+        alpha_thresh = int(os.getenv("SHADOW_MASK_REMOVE_THRESHOLD", "8"))
         remove = recipient_rgba.split()[3].point(lambda a: 255 if a > alpha_thresh else 0)
-        dilate = int(options.get("remove_dilate", os.getenv("SHADOW_MASK_REMOVE_DILATE", "4")))
+        dilate = int(os.getenv("SHADOW_MASK_REMOVE_DILATE", "4"))
         for _ in range(max(0, dilate)):
             remove = remove.filter(ImageFilter.MaxFilter(3))
         shadow_alpha = ImageChops.subtract(shadow_alpha, remove)
         if _mask_max(shadow_alpha) == 0:
             shadow_alpha = pre_remove
 
-    shadow_source = os.getenv("SHADOW_MASK_SOURCE", "donor").strip().lower()
-    auto_align = options.get("align")
-    if auto_align is None:
-        auto_align = _env_flag("SHADOW_MASK_ALIGN") is not False
-    if shadow_source == "donor" and should_align_donor():
-        auto_align = False
-
-    if auto_align:
+    align_enabled = _env_flag("SHADOW_MASK_ALIGN")
+    if align_enabled is None:
+        align_enabled = True
+    if align_enabled:
         pre_align = shadow_alpha
-        width_factor = float(options.get("align_width_factor", os.getenv("SHADOW_ALIGN_WIDTH_FACTOR", "1.0")))
-        threshold = int(options.get("align_threshold", os.getenv("SHADOW_ALIGN_THRESHOLD", "12")))
+        width_factor = float(os.getenv("SHADOW_ALIGN_WIDTH_FACTOR", "1.0"))
+        threshold = int(os.getenv("SHADOW_ALIGN_THRESHOLD", "12"))
         if threshold <= 0:
             arr = np.asarray(shadow_alpha).astype(np.float32)
             pct = float(os.getenv("SHADOW_ALIGN_PERCENTILE", "90"))
             threshold = int(np.percentile(arr, pct))
-        offset_x = int(options.get("align_offset_x", os.getenv("SHADOW_ALIGN_OFFSET_X", "0")))
-        offset_y = int(options.get("align_offset_y", os.getenv("SHADOW_ALIGN_OFFSET_Y", "0")))
-        align_mode = str(os.getenv("SHADOW_ALIGN_MODE", "bbox")).strip().lower()
+        offset_x = int(os.getenv("SHADOW_ALIGN_OFFSET_X", "0"))
+        offset_y = int(os.getenv("SHADOW_ALIGN_OFFSET_Y", "0"))
+        align_mode = str(os.getenv("SHADOW_ALIGN_MODE", "feet")).strip().lower()
         if align_mode == "feet":
             shadow_alpha = align_shadow_alpha_to_feet(
                 shadow_alpha,
@@ -1069,8 +764,7 @@ def apply_shadow_mask_to_recipient(
                 offset_x,
                 offset_y,
             )
-        # Re-apply recipient removal after alignment.
-        if _env_flag("SHADOW_MASK_REMOVE_RECIPIENT") is not False:
+        if remove_enabled:
             alpha_thresh = int(os.getenv("SHADOW_MASK_REMOVE_THRESHOLD", "8"))
             remove = recipient_rgba.split()[3].point(lambda a: 255 if a > alpha_thresh else 0)
             dilate = int(os.getenv("SHADOW_MASK_REMOVE_DILATE", "4"))
@@ -1080,119 +774,15 @@ def apply_shadow_mask_to_recipient(
         if _mask_max(shadow_alpha) == 0:
             shadow_alpha = pre_align
 
-    # Cleanup: drop faint noise and clip to recipient footprint.
-    min_alpha = int(options.get("min_alpha", os.getenv("SHADOW_MASK_MIN_ALPHA", "0")))
-    if min_alpha > 0:
-        shadow_alpha = shadow_alpha.point(lambda a: 0 if a < min_alpha else a)
-
-    clip_enabled = options.get("clip_to_recipient")
-    if clip_enabled is None:
-        clip_enabled = _env_flag("SHADOW_MASK_CLIP_TO_RECIPIENT") is not False
-    if clip_enabled:
-        pre_clip = shadow_alpha
-        rec_bbox = _alpha_bbox(recipient_rgba)
-        if rec_bbox:
-            x_margin = int(options.get("clip_x_margin", os.getenv("SHADOW_MASK_CLIP_X_MARGIN", "80")))
-            y_margin = int(options.get("clip_y_margin", os.getenv("SHADOW_MASK_CLIP_Y_MARGIN", "0")))
-            above_offset = int(options.get("clip_above_offset", os.getenv("SHADOW_MASK_CLIP_ABOVE_OFFSET", "8")))
-            x0 = max(0, rec_bbox[0] - x_margin)
-            x1 = min(recipient_rgba.size[0], rec_bbox[2] + x_margin)
-            y0 = max(0, rec_bbox[1] - y_margin)
-            if y_margin > 0:
-                y1 = min(recipient_rgba.size[1], rec_bbox[3] + y_margin)
-            else:
-                y1 = recipient_rgba.size[1]
-            cutoff = max(0, rec_bbox[3] - above_offset)
-            clip_y0 = max(cutoff, y0)
-            clip_threshold = int(os.getenv("SHADOW_MASK_CLIP_THRESHOLD", "4"))
-            sh_bbox = _mask_bbox(shadow_alpha, threshold=clip_threshold)
-            if sh_bbox and sh_bbox[3] <= clip_y0:
-                shadow_alpha = pre_clip
-            else:
-                region = shadow_alpha.crop((x0, clip_y0, x1, y1))
-                clipped = Image.new("L", shadow_alpha.size, 0)
-                clipped.paste(region, (x0, clip_y0))
-                shadow_alpha = clipped
-            empty_threshold = int(os.getenv("SHADOW_MASK_CLIP_EMPTY_THRESHOLD", "4"))
-            if _mask_max(shadow_alpha) <= empty_threshold:
-                shadow_alpha = pre_clip
-        if _mask_max(shadow_alpha) == 0:
-            shadow_alpha = pre_clip
-
-    floor_only = options.get("floor_only")
-    if floor_only is None:
-        floor_only = _env_flag("SHADOW_MASK_FLOOR_ONLY") is True
-    if floor_only:
-        rec_bbox = options.get("floor_bbox")
-        if rec_bbox is None:
-            rec_bbox = _alpha_bbox(recipient_rgba)
-        if rec_bbox:
-            offset = int(options.get("floor_offset", os.getenv("SHADOW_MASK_FLOOR_OFFSET", "0")))
-            cutoff = max(0, min(shadow_alpha.size[1], rec_bbox[3] + offset))
-            if cutoff > 0:
-                region = shadow_alpha.crop((0, cutoff, shadow_alpha.size[0], shadow_alpha.size[1]))
-                clipped = Image.new("L", shadow_alpha.size, 0)
-                clipped.paste(region, (0, cutoff))
-                shadow_alpha = clipped
-
     shadow_layer = Image.new("RGBA", recipient_rgba.size, (0, 0, 0, 0))
     shadow_layer.putalpha(shadow_alpha)
 
-    # Output: replace recipient alpha with shadow alpha.
+    combined = ImageChops.lighter(recipient_rgba.split()[3], shadow_alpha)
     output_rgba = recipient_rgba.copy()
-    combine_alpha = options.get("combine_recipient_alpha")
-    if combine_alpha is None:
-        combine_alpha = _env_flag("SHADOW_MASK_COMBINE_RECIPIENT_ALPHA")
-    if combine_alpha:
-        combined = ImageChops.lighter(recipient_rgba.split()[3], shadow_alpha)
-        output_rgba.putalpha(combined)
-    else:
-        output_rgba.putalpha(shadow_alpha)
+    output_rgba.putalpha(combined)
 
-    # Preview: keep recipient visible with shadow laid underneath.
     preview_rgba = Image.alpha_composite(shadow_layer, recipient_rgba)
     return output_rgba, preview_rgba, shadow_alpha
-
-
-def apply_shadow_to_recipient_rgb(
-    recipient_path: Path, mask_bytes: bytes, options: Optional[dict] = None
-) -> Tuple[Image.Image, Image.Image, Image.Image]:
-    with Image.open(recipient_path) as rec:
-        recipient_rgba = rec.convert("RGBA")
-
-    with Image.open(BytesIO(mask_bytes)) as mask_img:
-        mask = mask_img.convert("L")
-    if mask.size != recipient_rgba.size:
-        mask = mask.resize(recipient_rgba.size, Image.LANCZOS)
-
-    options = options or {}
-    white_is_shadow = options.get("white_is_shadow")
-    if white_is_shadow is None:
-        white_is_shadow = _env_flag("SHADOW_MASK_WHITE_IS_SHADOW")
-    if white_is_shadow is None:
-        white_is_shadow = True
-    shadow_alpha = mask if white_is_shadow else ImageOps.invert(mask)
-
-    strength = float(os.getenv("SHADOW_MASK_STRENGTH", "1.0"))
-    if strength != 1.0:
-        shadow_alpha = shadow_alpha.point(lambda a: int(max(0, min(255, a * strength))))
-
-    # Step 1: transparent canvas with only shadow darkness.
-    shadow_layer = Image.new("RGBA", recipient_rgba.size, (0, 0, 0, 0))
-    shadow_layer.putalpha(shadow_alpha)
-
-    # Step 2: composite shadow layer onto recipient RGB, preserving recipient alpha.
-    composited = Image.alpha_composite(recipient_rgba, shadow_layer)
-    composited.putalpha(recipient_rgba.split()[3])
-
-    return composited, composited.copy(), shadow_alpha
-
-
-def _mask_max_value(img: Image.Image) -> int:
-    extrema = img.getextrema()
-    if isinstance(extrema, tuple):
-        return extrema[1]
-    return 0
 
 
 def composite_on_background(img: Image.Image, bg_color: Tuple[int, int, int]) -> Image.Image:
@@ -1206,9 +796,8 @@ def load_image_bytes_for_api(
     long_edge: int,
     force_opaque: bool = False,
     bg_color: Tuple[int, int, int] = (255, 255, 255),
-    pad_config: Optional[dict] = None,
     temp_name: Optional[str] = None,
-) -> Tuple[str, bytes, Tuple[int, int], Optional[PadInfo]]:
+) -> Tuple[str, bytes, Tuple[int, int]]:
     """Always returns PNG bytes for Gemini to avoid TIFF ingestion issues."""
     with Image.open(path) as img:
         mode = "RGBA" if img.mode in ("RGBA", "LA") else "RGB"
@@ -1217,28 +806,7 @@ def load_image_bytes_for_api(
             bg = Image.new("RGBA", converted.size, (*bg_color, 255))
             bg.alpha_composite(converted)
             converted = bg.convert("RGB")
-        pad_info: Optional[PadInfo] = None
-        if pad_config:
-            pad_max_side = int(pad_config.get("max_side", long_edge))
-            pad_multiple = int(pad_config.get("multiple", 8))
-            pad_color = pad_config.get("pad_color", (255, 255, 255))
-            allowed = pad_config.get("allowed_ratios", SUPPORTED_RATIOS)
-            target_size = pad_config.get("target_size")
-            if target_size:
-                target_w, target_h = target_size
-            else:
-                target_w, target_h, _ = pick_target_size(
-                    converted.size[0],
-                    converted.size[1],
-                    max_side=pad_max_side,
-                    multiple=pad_multiple,
-                    allowed_ratios=allowed,
-                )
-            converted, pad_info = pad_letterbox(
-                converted, target_w, target_h, pad_color=pad_color
-            )
-        else:
-            converted = resize_to_long_edge(converted, long_edge)
+        converted = resize_to_long_edge(converted, long_edge)
         final_size = converted.size
         # Saving to a real temp file avoids PIL _idat.fileno issues on some builds.
         if temp_name:
@@ -1246,14 +814,14 @@ def load_image_bytes_for_api(
                 tmp_path = Path(tmpdir) / temp_name
                 converted.save(tmp_path, format="PNG")
                 data = tmp_path.read_bytes()
-                return "image/png", data, final_size, pad_info
+                return "image/png", data, final_size
         tmp_path: Optional[Path] = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = Path(tmp.name)
             converted.save(tmp_path, format="PNG")
             data = tmp_path.read_bytes()
-            return "image/png", data, final_size, pad_info
+            return "image/png", data, final_size
         finally:
             if tmp_path and tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
@@ -1380,43 +948,21 @@ def request_shadowed_image(
     max_side: int,
     prompt_text: str,
     flatten_output: Optional[bool] = None,
-    enforce_mode: str = "pad",
     attempts: int = 3,
     backoff: int = 10,
 ) -> Tuple[bytes, bytes]:
     force_opaque = should_clear_recipient_alpha_for_submit()
     bg_color = _parse_rgb_env("RECIPIENT_BG_COLOR", (255, 255, 255))
-    pad_enabled = _env_flag("PAD_BEFORE_SEND") is True
-    pad_config: Optional[dict] = None
-    recipient_native_size: Optional[Tuple[int, int]] = None
-    if pad_enabled:
-        pad_max_side = int(os.getenv("PAD_MAX_SIDE", str(max_side)))
-        pad_multiple = int(os.getenv("PAD_MULTIPLE", "8"))
-        pad_color = _parse_rgb_env("PAD_COLOR", (255, 255, 255))
-        pad_config = {
-            "max_side": pad_max_side,
-            "multiple": pad_multiple,
-            "pad_color": pad_color,
-            "allowed_ratios": SUPPORTED_RATIOS,
-        }
-        with Image.open(recipient_path) as src_img:
-            recipient_native_size = src_img.size
-
-    recipient_mime, recipient_bytes, recipient_sent_size, recipient_pad = load_image_bytes_for_api(
+    recipient_mime, recipient_bytes, recipient_sent_size = load_image_bytes_for_api(
         recipient_path,
         max_side,
         force_opaque=force_opaque,
         bg_color=bg_color,
-        pad_config=pad_config,
         temp_name="recipiant.png",
     )
-    if pad_enabled and recipient_pad:
-        pad_config = dict(pad_config or {})
-        pad_config["target_size"] = (recipient_pad.sent_w, recipient_pad.sent_h)
-    donor_mime, donor_bytes, _, _ = load_image_bytes_for_api(
+    donor_mime, donor_bytes, _ = load_image_bytes_for_api(
         donor_path,
         max_side,
-        pad_config=pad_config,
         temp_name="donor.png",
     )
     if DONOR_CONTRAST_BOOST != 1.0:
@@ -1425,7 +971,7 @@ def request_shadowed_image(
             buffer = BytesIO()
             boosted.save(buffer, format="PNG")
             donor_bytes = buffer.getvalue()
-    recipient_output_size = recipient_native_size or recipient_sent_size
+    recipient_output_size = recipient_sent_size
     prompt = prompt_text
     print(
         f"[submit] recipient={recipient_path.name} size={recipient_sent_size[0]}x{recipient_sent_size[1]} "
@@ -1452,18 +998,7 @@ def request_shadowed_image(
                 ),
             )
             raw_bytes = extract_image_from_response(response)
-            if pad_enabled and recipient_pad:
-                with Image.open(BytesIO(raw_bytes)) as returned:
-                    cropped = crop_back_from_letterbox(returned, recipient_pad)
-                    if cropped.size != recipient_output_size:
-                        cropped = cropped.resize(recipient_output_size, Image.LANCZOS)
-                    buffer = BytesIO()
-                    cropped.save(buffer, format="PNG")
-                    final_bytes = buffer.getvalue()
-            else:
-                final_bytes = enforce_output_dimensions(
-                    raw_bytes, recipient_output_size, mode=enforce_mode
-                )
+            final_bytes = enforce_output_dimensions(raw_bytes, recipient_output_size)
             if flatten_output is None:
                 flatten_output = should_flatten_output()
             if flatten_output:
@@ -1848,48 +1383,24 @@ def main() -> None:
         if should_clear_recipient_alpha_for_submit():
             print("   Recipient alpha cleared for submission.")
         shadow_request_max_side = effective_max_side
-        shadow_source = "model"
         if shadow_only_mode:
-            shadow_source = shadow_mask_source("model")
-            if shadow_source == "model":
-                # Avoid upscaling the recipient for shadow masks; keep native low_res size.
-                with Image.open(recipient_low) as rec_img:
-                    shadow_request_max_side = min(
-                        shadow_request_max_side, max(rec_img.size)
-                    )
-        if shadow_only_mode:
-            print(f"   Shadow-only mode: deriving mask from {shadow_source}.")
-            if shadow_source == "model":
-                enforce_mode = "stretch"
-                if _env_flag("SHADOW_MASK_USE_CORNERS") is True:
-                    enforce_mode = "corner"
-                print(
-                    f"   Sending both images to Gemini as PNG (converted in-memory, "
-                    f"long_edge={shadow_request_max_side or 'original'}); enforcing responses to the same size."
+            # Avoid upscaling the recipient for shadow masks; keep native low_res size.
+            with Image.open(recipient_low) as rec_img:
+                shadow_request_max_side = min(shadow_request_max_side, max(rec_img.size))
+            print("   Shadow-only mode: requesting shadow mask from model.")
+            try:
+                raw_bytes, mask_bytes = request_shadowed_image(
+                    client_local,
+                    model_id,
+                    recipient_low,
+                    donor_low,
+                    shadow_request_max_side,
+                    prompt_text,
+                    flatten_output=False,
                 )
-                try:
-                    raw_bytes, mask_bytes = request_shadowed_image(
-                        client_local,
-                        model_id,
-                        recipient_low,
-                        donor_low,
-                        shadow_request_max_side,
-                        prompt_text,
-                        flatten_output=False,
-                        enforce_mode=enforce_mode,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"Failed to process {recipient_path.name}: {exc}")
-                    return
-            else:
-                if shadow_source == "recipient":
-                    mask_img = extract_shadow_mask_from_recipient(recipient_low)
-                else:
-                    mask_img = extract_shadow_mask_from_donor(donor_low)
-                mask_bytes_io = BytesIO()
-                mask_img.save(mask_bytes_io, format="PNG")
-                raw_bytes = mask_bytes_io.getvalue()
-                mask_bytes = raw_bytes
+            except Exception as exc:  # noqa: BLE001
+                print(f"Failed to process {recipient_path.name}: {exc}")
+                return
         else:
             print(
                 f"   Sending both images to Gemini as PNG (converted in-memory, "
@@ -1916,160 +1427,9 @@ def main() -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if shadow_only_mode:
-            # Treat derived mask as grayscale shadow mask.
-            simple_mask = _env_flag("SHADOW_MASK_SIMPLE")
-            if simple_mask is None:
-                simple_mask = True
-            align_mask = (_env_flag("SHADOW_MASK_ALIGN") is not False) and (
-                shadow_source != "model" or (_env_flag("SHADOW_MASK_ALIGN_MODEL") is True)
+            out_rgba, preview_rgba, processed_mask = apply_shadow_mask_to_recipient(
+                recipient_low, mask_bytes
             )
-            floor_only_flag = _env_flag("SHADOW_MASK_FLOOR_ONLY") is True
-            floor_bbox = None
-            if floor_only_flag:
-                with Image.open(recipient_low) as rec_img:
-                    floor_bbox = _alpha_bbox(rec_img.convert("RGBA"))
-            use_raw_alpha = _env_flag("SHADOW_MASK_USE_RAW_ALPHA") is not False
-            apply_to_rgb = _env_flag("SHADOW_MASK_APPLY_TO_RGB") is True
-            overlay_raw_only = _env_flag("SHADOW_MASK_OVERLAY_RAW_ONLY") is True
-            apply_options = None
-            if simple_mask:
-                apply_options = {
-                    "clip_to_recipient": False if use_raw_alpha else False,
-                    "align": align_mask,
-                    "remove_recipient": _env_flag("SHADOW_MASK_REMOVE_RECIPIENT") is not False,
-                    "remove_threshold": int(os.getenv("SHADOW_MASK_REMOVE_THRESHOLD", "8")),
-                    "remove_dilate": int(os.getenv("SHADOW_MASK_REMOVE_DILATE", "4")),
-                    "white_is_shadow": False,
-                    "combine_recipient_alpha": True,
-                    "floor_only": False if use_raw_alpha else floor_only_flag,
-                    "floor_bbox": floor_bbox,
-                    "clear_corner_marks": _env_flag("SHADOW_MASK_CLEAR_CORNER_MARKS") is True,
-                    "normalize_mask": False if use_raw_alpha else None,
-                    "min_alpha": 0 if use_raw_alpha else None,
-                }
-            elif apply_options is None:
-                apply_options = {
-                    "white_is_shadow": False,
-                    "combine_recipient_alpha": True,
-                    "align": align_mask,
-                    "remove_recipient": _env_flag("SHADOW_MASK_REMOVE_RECIPIENT") is not False,
-                    "remove_threshold": int(os.getenv("SHADOW_MASK_REMOVE_THRESHOLD", "8")),
-                    "remove_dilate": int(os.getenv("SHADOW_MASK_REMOVE_DILATE", "4")),
-                    "floor_only": False if use_raw_alpha else floor_only_flag,
-                    "floor_bbox": floor_bbox,
-                    "clear_corner_marks": _env_flag("SHADOW_MASK_CLEAR_CORNER_MARKS") is True,
-                    "normalize_mask": False if use_raw_alpha else None,
-                    "clip_to_recipient": False if use_raw_alpha else None,
-                    "min_alpha": 0 if use_raw_alpha else None,
-                }
-            force_alpha = _env_flag("SHADOW_MASK_FORCE_ALPHA") is True
-            if force_alpha:
-                out_rgba, preview_rgba, processed_mask = apply_shadow_mask_to_recipient(
-                    recipient_low, mask_bytes, options=apply_options
-                )
-            elif overlay_raw_only:
-                # Force raw overlay workflow: no extra processing.
-                apply_options = {
-                    "white_is_shadow": False,
-                }
-                out_rgba, preview_rgba, processed_mask = apply_shadow_to_recipient_rgb(
-                    recipient_low, mask_bytes, options=apply_options
-                )
-            elif apply_to_rgb:
-                out_rgba, preview_rgba, processed_mask = apply_shadow_to_recipient_rgb(
-                    recipient_low, mask_bytes, options=apply_options
-                )
-            else:
-                out_rgba, preview_rgba, processed_mask = apply_shadow_mask_to_recipient(
-                    recipient_low, mask_bytes, options=apply_options
-                )
-
-            if _env_flag("SHADOW_MASK_COMPOSITE_RECIPIENT_OVER_RAW") is True:
-                try:
-                    with Image.open(BytesIO(raw_bytes)) as raw_img:
-                        raw_rgba = raw_img.convert("RGBA")
-                    if raw_rgba.size != out_rgba.size:
-                        raw_rgba = raw_rgba.resize(out_rgba.size, Image.LANCZOS)
-                    composite_rgb = Image.alpha_composite(raw_rgba, out_rgba.convert("RGBA"))
-                    composite_rgb.putalpha(out_rgba.split()[3])
-                    out_rgba = composite_rgb
-                    preview_rgba = composite_rgb.copy()
-                except Exception:
-                    pass
-
-            # Enforce recipient size for all shadow-only outputs.
-            with Image.open(recipient_low) as rec_img:
-                target_size = rec_img.size
-            if out_rgba.size != target_size:
-                out_rgba = out_rgba.resize(target_size, Image.LANCZOS)
-            if preview_rgba.size != target_size:
-                preview_rgba = preview_rgba.resize(target_size, Image.LANCZOS)
-            if processed_mask.size != target_size:
-                processed_mask = processed_mask.resize(target_size, Image.LANCZOS)
-            if not simple_mask:
-                retry_threshold = int(os.getenv("SHADOW_MASK_RETRY_THRESHOLD", "0"))
-                if _mask_max_value(processed_mask) <= retry_threshold:
-                    print("   Mask processed to zero; retrying shadow extraction with relaxed settings...")
-                    shadow_source = shadow_mask_source("model")
-                    if shadow_source == "recipient":
-                        retry_mask = extract_shadow_mask_from_recipient(recipient_low)
-                    elif shadow_source == "model":
-                        try:
-                            enforce_mode = "stretch"
-                            if _env_flag("SHADOW_MASK_USE_CORNERS") is True:
-                                enforce_mode = "corner"
-                            raw_bytes, retry_bytes = request_shadowed_image(
-                                client_local,
-                                model_id,
-                                recipient_low,
-                                donor_low,
-                                effective_max_side,
-                                prompt_text,
-                                flatten_output=False,
-                                enforce_mode=enforce_mode,
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            print(f"Failed to process {recipient_path.name}: {exc}")
-                            return
-                    else:
-                        retry_mask = extract_shadow_mask_from_donor(
-                            donor_low,
-                            normalize=True,
-                            percentile=float(os.getenv("SHADOW_EXTRACT_RETRY_PERCENTILE", "95")),
-                            gamma=float(os.getenv("SHADOW_EXTRACT_RETRY_GAMMA", "0.8")),
-                        )
-                    if shadow_source != "model":
-                        retry_bytes_io = BytesIO()
-                        retry_mask.save(retry_bytes_io, format="PNG")
-                        retry_bytes = retry_bytes_io.getvalue()
-
-                    retry_options = {
-                        "clip_to_recipient": False,
-                        "min_alpha": 0,
-                        "align": False,
-                        "remove_recipient": _env_flag("SHADOW_MASK_RETRY_REMOVE_RECIPIENT") is not False,
-                        "remove_threshold": int(
-                            os.getenv("SHADOW_MASK_RETRY_REMOVE_THRESHOLD", "4")
-                        ),
-                        "remove_dilate": int(os.getenv("SHADOW_MASK_RETRY_REMOVE_DILATE", "2")),
-                    }
-                    retry_out, retry_preview, retry_processed = apply_shadow_mask_to_recipient(
-                        recipient_low, retry_bytes, options=retry_options
-                    )
-                    if _mask_max_value(retry_processed) > _mask_max_value(processed_mask):
-                        raw_bytes = retry_bytes
-                        mask_bytes = retry_bytes
-                        out_rgba = retry_out
-                        preview_rgba = retry_preview
-                        processed_mask = retry_processed
-                        raw_path.write_bytes(retry_bytes)
-
-                        retry_raw_path = DEBUG_DIR / f"{stem_base}_PID{prompt_id_label}_shadowmask_retry.png"
-                        retry_raw_path.parent.mkdir(parents=True, exist_ok=True)
-                        retry_raw_path.write_bytes(retry_bytes)
-                        print(f"Mask retry raw: {retry_raw_path}")
-                    else:
-                        print("   Retry did not improve mask; keeping original.")
 
             out_rgba.save(output_path, format="PNG")
             print(f"Wrote {output_path}")
@@ -2104,6 +1464,11 @@ def main() -> None:
             preview_path = DEBUG_DIR / f"{stem_base}_PID{prompt_id_label}_preview.png"
             preview.save(preview_path, format="PNG")
             print(f"Preview: {preview_path}")
+
+            preview_output = SCRIPT_DIR / "output" / f"{stem_base}_PID{prompt_id_label}_preview.png"
+            preview_output.parent.mkdir(parents=True, exist_ok=True)
+            preview.save(preview_output, format="PNG")
+            print(f"Preview output: {preview_output}")
 
             preview_bytes = BytesIO()
             preview.save(preview_bytes, format="PNG")

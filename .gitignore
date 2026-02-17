@@ -7,6 +7,15 @@ vertex.json
 # Misc
 .DS_Store
 
+# Generated artifacts
+debug/
+output/
+
+# Products folder structure only (keep .gitkeep)
+products/**/*
+!products/.gitkeep
+!products/**/.gitkeep
+
 # Large binary assets should not be committed
 *.tif
 *.tiff
