@@ -16,10 +16,18 @@ PID means Prompt ID.
 
 - Default prompt file: `prompts/mv_shd_donor_to_recipient_PID1.md`
 - Shadow-only prompt example: `prompts/create_shadow_only_PID2.md` (returns a grayscale shadow mask). In shadow-only mode, the output PNG keeps recipient RGB but replaces its alpha with the shadow mask.
+- Shadow-only masks can come from the model (`SHADOW_MASK_SOURCE="model"`) or from local extraction (`donor`/`recipient`).
+- Mask polarity is controlled by `SHADOW_MASK_WHITE_IS_SHADOW` (set `false` when white = no shadow).
+- Set `SHADOW_MASK_SIMPLE=true` to apply the mask with no cleanup/clip/align/removal.
+- Recipient alpha can be cleared before submission with `CLEAR_RECIPIENT_ALPHA=true` (composited on `RECIPIENT_BG_COLOR`).
+- Recipient low_res PNGs can have background alpha shadows removed with `CLEAR_RECIPIENT_BG_ALPHA=true` and `RECIPIENT_ALPHA_BG_THRESHOLD` (binarizes alpha).
+- Shadow-only masks can be sourced from `SHADOW_MASK_SOURCE=model`, `recipient`, or `donor`.
+- Shadow extraction normalization: `SHADOW_EXTRACT_NORMALIZE=true` with `SHADOW_EXTRACT_PERCENTILE`.
 - Select a prompt with `PROMPT_ID` or `PROMPT_PATH` in `.env`, or pass `--pid` (defaults to PID1).
 - Use `--force` to overwrite existing outputs/debug images.
 - Use `--async N` to run up to N submissions concurrently, or set `MAX_ASYNC` in `.env`.
 - Use `--clean` to delete generated artifacts (low_res, generated outputs, debug) and exit.
+- Optional pad-before-send: set `PAD_BEFORE_SEND=true` to letterbox to the closest supported ratio before sending to Gemini, and crop the response back to the original content area. Configure with `PAD_MAX_SIDE`, `PAD_MULTIPLE`, and `PAD_COLOR`.
 
 ## Paths
 
