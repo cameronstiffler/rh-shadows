@@ -980,6 +980,11 @@ def request_shadowed_image(
     print(
         f"[submit] donor={donor_path.name} bytes={len(donor_bytes)} mime={donor_mime}"
     )
+    if _env_flag("DEBUG_SAVE_RECIPIENT_SUBMIT"):
+        debug_path = DEBUG_DIR / f"{recipient_path.stem}_submit.png"
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_path.write_bytes(recipient_bytes)
+        print(f"[debug] recipient submit: {debug_path}")
 
     last_exc: Optional[Exception] = None
     for attempt in range(1, max(1, attempts) + 1):

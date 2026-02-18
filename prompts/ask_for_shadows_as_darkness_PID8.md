@@ -1,0 +1,3 @@
+Task: Shadow IsolationUnattached Shadow Segmentation: In the Submitted image, identify and isolate the existing cast unattached shadows by the subject onto the floor surface. Utilize a generous selection radius to capture the full periphery of the ambient occlusion and unattached shadows. Make sure to cafefully caputure the existing unattached shadows in the image who may be long, thin and fade gradually.
+
+Output: Return a grayscale image of the unattached shadows the subject in Submitted image casts. Beside the unattached shadows the subject cast, all else must me pure white with the exception of a black border that shows the location of the edge of the original Submitted Image
